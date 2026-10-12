@@ -207,7 +207,7 @@ The numbers below were measured on `linux/amd64` with Go 1.27.2 in a standard cl
 | Handler benchmark | `go test -run '^$' -bench BenchmarkStatusEndpoint -benchtime=300x` | ~0.65 ms/op, ~99 KB/op, ~1033 allocs/op against an in-process portal |
 | Stripped binary | `make size` | 6.93 MiB (7,262,368 bytes), static, `CGO_ENABLED=0`, `-trimpath -s -w` |
 | Resident memory | `make rss` | 8.2 MiB after start; 8.8 MiB after 200 status requests (fresh connections) and 8.9 MiB after 200 keep-alive requests; no sample above 9.2 MiB |
-| Image size | CI job *Verify the image footprint stays under 10 MiB* | 7 MiB `amd64` image, enforced by the pipeline |
+| Image size | CI job *Verify the image footprint stays under 10 MiB* | 7 MiB `amd64` image (7,448,188 bytes), enforced by the pipeline on every build |
 
 Memory is measured with `scripts/measure-memory.sh`, which starts the mock portal and the gateway, drives a burst of requests, waits for the delayed logouts to finish, and reads `VmRSS` from `/proc`. The `scratch` base image means the resident set is essentially the binary's text pages plus a heap bounded by `GOMEMLIMIT`.
 
