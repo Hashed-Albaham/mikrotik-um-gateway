@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -25,11 +26,17 @@ import (
 	"time"
 )
 
-// Environment variables. Only UM_HOST is mandatory; everything else has a
-// documented default so the container can be started with plain defaults.
+// Environment variables. Either UM_TARGET_URL or UM_HOST is mandatory;
+// everything else has a documented default so the container can be started with
+// plain defaults.
 const (
+	envUMTargetURL   = "UM_TARGET_URL"
 	envUMHost        = "UM_HOST"
+	envUMProto       = "UM_PROTO"
+	envUMPort        = "UM_PORT"
+	envUMSkipVerify  = "UM_INSECURE_SKIP_VERIFY"
 	envListenAddr    = "LISTEN_ADDR"
+	envPort          = "PORT"
 	envLogoutDelay   = "LOGOUT_DELAY_SECONDS"
 	envRequestTimout = "REQUEST_TIMEOUT_SECONDS"
 	envAllowedOrigin = "ALLOWED_ORIGIN"
@@ -37,9 +44,10 @@ const (
 
 	defaultListenAddr      = ":8080"
 	defaultLogoutDelaySecs = 60
-	defaultRequestTimeout  = 15 * time.Second
+	defaultRequestTimeout  = 6 * time.Second
 	defaultAllowedOrigin   = "*"
 	logoutCallTimeout      = 20 * time.Second
+	maxRequestBodyBytes    = 1 << 10
 )
 
 // config holds the runtime configuration of the gateway.
@@ -50,29 +58,38 @@ type config struct {
 	requestTimeout time.Duration
 	allowedOrigin  string
 	releaseMemory  bool
+	skipTLSVerify  bool
 }
 
 // loadConfig reads the environment and validates it.
 func loadConfig() (config, error) {
 	cfg := config{
-		umHost:         strings.TrimSpace(os.Getenv(envUMHost)),
 		listenAddr:     strings.TrimSpace(os.Getenv(envListenAddr)),
 		logoutDelay:    defaultLogoutDelaySecs * time.Second,
 		requestTimeout: defaultRequestTimeout,
 		allowedOrigin:  defaultAllowedOrigin,
 		releaseMemory:  true,
+		skipTLSVerify:  true,
 	}
+
+	baseURL, err := resolveUMBaseURL()
+	if err != nil {
+		return config{}, err
+	}
+	cfg.umHost = baseURL
+
 	if cfg.listenAddr == "" {
 		cfg.listenAddr = defaultListenAddr
+		if raw := strings.TrimSpace(os.Getenv(envPort)); raw != "" {
+			port, err := strconv.Atoi(raw)
+			if err != nil || port <= 0 || port > 65535 {
+				return config{}, fmt.Errorf("%s must be a valid TCP port, got %q", envPort, raw)
+			}
+			cfg.listenAddr = ":" + raw
+		}
 	}
 	if origin := strings.TrimSpace(os.Getenv(envAllowedOrigin)); origin != "" {
 		cfg.allowedOrigin = origin
-	}
-	if cfg.umHost == "" {
-		return config{}, fmt.Errorf("%s is required (for example http://192.168.88.1)", envUMHost)
-	}
-	if !strings.HasPrefix(cfg.umHost, "http://") && !strings.HasPrefix(cfg.umHost, "https://") {
-		cfg.umHost = "http://" + cfg.umHost
 	}
 	if raw := strings.TrimSpace(os.Getenv(envLogoutDelay)); raw != "" {
 		seconds, err := strconv.Atoi(raw)
@@ -95,29 +112,67 @@ func loadConfig() (config, error) {
 		}
 		cfg.releaseMemory = enabled
 	}
+	if raw := strings.TrimSpace(os.Getenv(envUMSkipVerify)); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("%s must be a boolean, got %q", envUMSkipVerify, raw)
+		}
+		cfg.skipTLSVerify = enabled
+	}
 	return cfg, nil
 }
 
-// Quantity, StatusResponse and ErrorResponse form the public JSON contract.
+// resolveUMBaseURL builds the portal base URL from either a full URL or from
+// the protocol, host and port parts.
+func resolveUMBaseURL() (string, error) {
+	if raw := strings.TrimSpace(os.Getenv(envUMTargetURL)); raw != "" {
+		return normalizeBaseURL(raw)
+	}
 
-// statusResponse is the unified payload returned for a successful lookup.
-type statusResponse struct {
-	Success           bool     `json:"success"`
-	MaskedUser        string   `json:"masked_user"`
-	DataLeft          Quantity `json:"data_left"`
-	TimeLeft          Quantity `json:"time_left"`
-	RemainingValidity Quantity `json:"remaining_validity"`
-	TotalValidity     Quantity `json:"total_validity"`
-	ProfileState      string   `json:"profile_state"`
-	ActiveSessions    int      `json:"active_sessions"`
+	host := strings.TrimSpace(os.Getenv(envUMHost))
+	if host == "" {
+		return "", fmt.Errorf("%s or %s is required (for example %s=http://192.168.88.1)", envUMTargetURL, envUMHost, envUMHost)
+	}
+	if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
+		return normalizeBaseURL(host)
+	}
 
-	Profile        string    `json:"profile,omitempty"`
-	DataUsed       *Quantity `json:"data_used,omitempty"`
-	TimeUsed       *Quantity `json:"time_used,omitempty"`
-	ValidityEndsAt string    `json:"validity_ends_at,omitempty"`
-	LimitsSource   string    `json:"limits_source,omitempty"`
-	Warnings       []string  `json:"warnings,omitempty"`
-	GeneratedAt    string    `json:"generated_at"`
+	proto := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv(envUMProto)), "://"))
+	if proto == "" {
+		proto = "http"
+	}
+	if proto != "http" && proto != "https" {
+		return "", fmt.Errorf("%s must be http or https, got %q", envUMProto, proto)
+	}
+	host = strings.Trim(host, "/")
+	if port := strings.TrimSpace(os.Getenv(envUMPort)); port != "" {
+		if _, err := strconv.Atoi(port); err != nil || port == "" {
+			return "", fmt.Errorf("%s must be a valid TCP port, got %q", envUMPort, port)
+		}
+		if !strings.Contains(host, ":") {
+			host += ":" + port
+		}
+	}
+	return normalizeBaseURL(proto + "://" + host)
+}
+
+// normalizeBaseURL validates a base URL and removes a trailing slash.
+func normalizeBaseURL(raw string) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if base == "" {
+		return "", fmt.Errorf("user manager base URL is empty")
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("invalid user manager base URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("user manager base URL must use http or https, got %q", base)
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("user manager base URL has no host: %q", base)
+	}
+	return base, nil
 }
 
 // errorResponse is returned for every failure, with a stable machine readable
@@ -176,21 +231,27 @@ func main() {
 }
 
 // routes builds the HTTP routing table wrapped in the CORS middleware.
+// "/api/status" and "/api/user-status" are the same handler under two names so
+// existing hotspot pages keep working.
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.handleStatus)
+	mux.HandleFunc("POST /api/status", s.handleStatus)
 	mux.HandleFunc("OPTIONS /api/status", s.handlePreflight)
+	mux.HandleFunc("GET /api/user-status", s.handleStatus)
+	mux.HandleFunc("POST /api/user-status", s.handleStatus)
+	mux.HandleFunc("OPTIONS /api/user-status", s.handlePreflight)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /", s.handleIndex)
 	return s.withCORS(mux)
 }
 
-// withCORS adds the CORS headers required by browser based dashboards.
+// withCORS adds the CORS headers required by browser based hotspot pages.
 func (s *server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", s.cfg.allowedOrigin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		w.Header().Set("Vary", "Origin")
 		next.ServeHTTP(w, r)
@@ -211,8 +272,12 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service":   "um-status-gateway",
-		"endpoints": []string{"GET /api/status?user=<id>&pass=<password>", "GET /healthz"},
+		"service": "um-status-gateway",
+		"endpoints": []string{
+			"GET|POST /api/status?user=<id>&pass=<password>",
+			"GET|POST /api/user-status?user=<id>&pass=<password>",
+			"GET /healthz",
+		},
 	})
 }
 
@@ -220,27 +285,32 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 // on-demand flow for a single account and answers before the delayed logout
 // fires.
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	user := strings.TrimSpace(query.Get("user"))
-	password := query.Get("pass")
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	if err := r.ParseForm(); err != nil && !errors.Is(err, http.ErrNotMultipart) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "the request body could not be parsed")
+		return
+	}
+
+	user := strings.TrimSpace(firstNonEmpty(r.Form.Get("user"), r.Form.Get("username")))
+	password := firstNonEmpty(r.Form.Get("pass"), r.Form.Get("password"))
 
 	if user == "" {
-		writeError(w, http.StatusBadRequest, "missing_user", "query parameter 'user' is required")
+		writeError(w, http.StatusBadRequest, "missing_user", "parameter 'user' is required")
 		return
 	}
 	if len(user) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_user", "query parameter 'user' is too long")
+		writeError(w, http.StatusBadRequest, "invalid_user", "parameter 'user' is too long")
 		return
 	}
 	if len(password) > 256 {
-		writeError(w, http.StatusBadRequest, "invalid_password", "query parameter 'pass' is too long")
+		writeError(w, http.StatusBadRequest, "invalid_password", "parameter 'pass' is too long")
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.requestTimeout)
 	defer cancel()
 
-	client, err := NewClient(s.cfg.umHost, s.cfg.requestTimeout, user)
+	client, err := NewClient(s.cfg.umHost, s.cfg.requestTimeout, user, s.cfg.skipTLSVerify)
 	if err != nil {
 		log.Printf("status user=%s failed: %v", maskUser(user), err)
 		writeError(w, http.StatusInternalServerError, "configuration_error", err.Error())
@@ -248,6 +318,11 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := client.Login(ctx, password); err != nil {
+		if errors.Is(err, errInvalidCredentials) {
+			log.Printf("status user=%s rejected: invalid credentials", maskUser(user))
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "the user manager rejected these credentials")
+			return
+		}
 		log.Printf("status user=%s: %v", maskUser(user), err)
 		writeError(w, http.StatusBadGateway, "login_failed", "could not open a user manager session")
 		return
@@ -264,17 +339,23 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// pending session does not hold buffers for the whole logout delay.
 	client.CloseIdleConnections()
 
-	response := buildStatus(user, payloads, time.Now())
+	response := buildStatus(user, payloads.user, payloads.profiles, time.Now())
 	writeJSON(w, http.StatusOK, response)
 
 	// The portal session is closed by a single one-shot timer, never by a loop.
 	s.scheduleLogout(client)
 	log.Printf("status user=%s state=%s data_left=%s time_left=%s",
-		response.MaskedUser, response.ProfileState, response.DataLeft.Human, response.TimeLeft.Human)
+		response.MaskedUsername, response.ProfileState, response.DataLeft, response.TimeLeft)
 }
 
-// fetchAll issues the three read calls concurrently and collects their results.
-// The first error is reported once every call has finished.
+// portalData carries the two concurrent User Manager responses.
+type portalData struct {
+	user     UserData
+	profiles []ProfileEntry
+}
+
+// fetchAll issues the two read calls concurrently and collects their results.
+// The first error is reported once both calls have finished.
 func fetchAll(ctx context.Context, client *Client) (portalData, error) {
 	var (
 		wg       sync.WaitGroup
@@ -283,13 +364,6 @@ func fetchAll(ctx context.Context, client *Client) (portalData, error) {
 		data     portalData
 	)
 
-	assign := func(target *any) func(any) {
-		return func(value any) {
-			mu.Lock()
-			defer mu.Unlock()
-			*target = value
-		}
-	}
 	recordErr := func(err error) {
 		if err == nil {
 			return
@@ -301,33 +375,22 @@ func fetchAll(ctx context.Context, client *Client) (portalData, error) {
 		}
 	}
 
-	// A semaphore keeps the concurrency at exactly three goroutines and bounds
-	// the peak memory of a single request.
-	sem := make(chan struct{}, 3)
-	wg.Add(3)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		sem <- struct{}{}
-		defer func() { <-sem }()
-		value, err := client.FetchUser(ctx)
+		user, err := client.FetchUser(ctx)
 		recordErr(err)
-		assign(&data.user)(value)
+		mu.Lock()
+		data.user = user
+		mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
-		sem <- struct{}{}
-		defer func() { <-sem }()
-		value, err := client.FetchUserProfiles(ctx)
+		profiles, err := client.FetchUserProfiles(ctx)
 		recordErr(err)
-		assign(&data.userProfiles)(value)
-	}()
-	go func() {
-		defer wg.Done()
-		sem <- struct{}{}
-		defer func() { <-sem }()
-		value, err := client.FetchProfiles(ctx)
-		recordErr(err)
-		assign(&data.profiles)(value)
+		mu.Lock()
+		data.profiles = profiles
+		mu.Unlock()
 	}()
 	wg.Wait()
 
@@ -378,4 +441,13 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 // account identifier or the password.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, errorResponse{Success: false, Code: code, Error: message})
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

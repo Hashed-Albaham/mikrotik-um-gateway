@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<!--
+  Balance check widget for a RouterOS v7 hotspot page.
+
+  Paste the marked block into login.html (or status.html) on the router, or use
+  this file as a standalone page. Two things must be true for it to work:
+
+    1. The hotspot must be allowed to reach the gateway container:
+       /ip hotspot walled-garden ip add action=accept dst-address=172.17.0.2 dst-port=8080
+    2. API_BASE below must point at the gateway, as seen from the client device.
+       That is normally the container address on the container network.
+
+  The page talks to GET /api/user-status and renders the human readable fields
+  of the response; the numeric values stay available under "raw" for scripts.
+-->
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>فحص رصيد الكرت</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      padding: 24px 16px;
+      background: #f2f4f7;
+      font-family: "Segoe UI", Tahoma, Arial, sans-serif;
+      color: #1f2933;
+    }
+    .card {
+      max-width: 360px;
+      margin: 0 auto;
+      background: #fff;
+      border: 1px solid #d9dfe7;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 1px 3px rgba(16, 24, 40, .08);
+    }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    p.hint { margin: 0 0 16px; font-size: 13px; color: #6b7280; }
+    label { display: block; font-size: 13px; margin-bottom: 4px; color: #374151; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px;
+      margin-bottom: 12px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font-size: 15px;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      border: 0;
+      border-radius: 8px;
+      background: #0b6bcb;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    button:disabled { background: #94a3b8; cursor: progress; }
+    #result { display: none; margin-top: 16px; border-top: 1px solid #e5e7eb; padding-top: 12px; }
+    .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 15px; }
+    .row span:first-child { color: #6b7280; }
+    .row b { font-weight: 600; }
+    .ok { color: #15803d; }
+    .warn { color: #b45309; }
+    #error {
+      display: none;
+      margin-top: 12px;
+      padding: 10px;
+      border-radius: 8px;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      color: #991b1b;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <!-- ===== begin widget ===== -->
+  <div class="card">
+    <h1>فحص رصيد الكرت</h1>
+    <p class="hint">أدخل رقم الكرت للاستعلام عن الرصيد والصلاحية.</p>
+
+    <label for="card_user">رقم الكرت</label>
+    <input id="card_user" type="text" inputmode="numeric" autocomplete="off" placeholder="مثال: 0018067158" value="$(username)">
+
+    <label for="card_pass">كلمة المرور (إن وُجدت)</label>
+    <input id="card_pass" type="password" autocomplete="off" placeholder="اتركها فارغة إن لم تكن مطلوبة">
+
+    <button id="card_submit" type="button" onclick="checkBalance()">فحص الرصيد</button>
+
+    <div id="error"></div>
+
+    <div id="result">
+      <div class="row"><span>الكرت</span><b id="r_user">-</b></div>
+      <div class="row"><span>الرصيد المتبقي</span><b id="r_data" class="ok">-</b></div>
+      <div class="row"><span>إجمالي الرصيد</span><b id="r_data_total">-</b></div>
+      <div class="row"><span>الوقت المتبقي</span><b id="r_time" class="ok">-</b></div>
+      <div class="row"><span>إجمالي الوقت</span><b id="r_time_total">-</b></div>
+      <div class="row"><span>الصلاحية المتبقية</span><b id="r_validity">-</b></div>
+      <div class="row"><span>حالة الاشتراك</span><b id="r_state">-</b></div>
+      <div class="row"><span>الجلسات النشطة</span><b id="r_sessions">-</b></div>
+    </div>
+  </div>
+
+  <script>
+    // Address of the gateway as reachable from the client device.
+    var API_BASE = "http://172.17.0.2:8080";
+
+    var STATE_LABELS = { active: "نشط", expired: "منتهي", unknown: "غير معروف" };
+
+    // On a RouterOS hotspot $(username) is substituted with the logged in
+    // account; when this page is opened elsewhere the token stays literal.
+    var userField = document.getElementById("card_user");
+    if (userField.value.indexOf("$(") === 0) {
+      userField.value = "";
+    }
+
+    function setText(id, value) {
+      document.getElementById(id).innerText = value || "-";
+    }
+
+    function showError(message) {
+      var box = document.getElementById("error");
+      box.innerText = message;
+      box.style.display = "block";
+    }
+
+    function checkBalance() {
+      var user = document.getElementById("card_user").value.trim();
+      var pass = document.getElementById("card_pass").value;
+      var button = document.getElementById("card_submit");
+      var box = document.getElementById("error");
+
+      box.style.display = "none";
+      if (!user) {
+        showError("يرجى إدخال رقم الكرت.");
+        return;
+      }
+
+      button.disabled = true;
+      button.innerText = "جارٍ الفحص...";
+
+      var url = API_BASE + "/api/user-status?user=" + encodeURIComponent(user) +
+                "&pass=" + encodeURIComponent(pass);
+
+      fetch(url, { cache: "no-store" })
+        .then(function (response) {
+          return response.json().then(function (data) {
+            return { status: response.status, data: data };
+          });
+        })
+        .then(function (result) {
+          var data = result.data || {};
+          if (!data.success) {
+            showError(data.error || "تعذر العثور على الكرت أو الرصيد غير متاح.");
+            return;
+          }
+          setText("r_user", data.masked_username);
+          setText("r_data", data.data_left);
+          setText("r_data_total", data.total_data);
+          setText("r_time", data.time_left);
+          setText("r_time_total", data.total_time);
+          setText("r_validity", data.remaining_validity);
+          setText("r_state", STATE_LABELS[data.profile_state] || data.profile_state);
+          var sessions = data.sessions || {};
+          setText("r_sessions", sessions.active_sessions);
+          document.getElementById("result").style.display = "block";
+        })
+        .catch(function (error) {
+          showError("تعذر الاتصال بخدمة الفحص. تحقق من اتصالك ثم أعد المحاولة.");
+          if (window.console) { console.error(error); }
+        })
+        .then(function () {
+          button.disabled = false;
+          button.innerText = "فحص الرصيد";
+        });
+    }
+  </script>
+  <!-- ===== end widget ===== -->
+</body>
+</html>

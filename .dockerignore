@@ -2,6 +2,7 @@
 .github
 bin
 scripts
+examples
 docs
 *.md
 Dockerfile

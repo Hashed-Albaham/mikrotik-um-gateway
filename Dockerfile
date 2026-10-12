@@ -34,12 +34,14 @@ FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /out/um-status-gateway /um-status-gateway
 
-# Runtime defaults. UM_HOST must be supplied by the caller.
+# Runtime defaults. Point the gateway at the portal with either UM_TARGET_URL or
+# UM_PROTO + UM_HOST + UM_PORT.
 ENV LISTEN_ADDR=:8080 \
     LOGOUT_DELAY_SECONDS=60 \
-    REQUEST_TIMEOUT_SECONDS=15 \
+    REQUEST_TIMEOUT_SECONDS=6 \
     ALLOWED_ORIGIN=* \
     RELEASE_MEMORY_ON_SESSION_END=true \
+    UM_INSECURE_SKIP_VERIFY=true \
     GOMEMLIMIT=4MiB \
     GOGC=20
 

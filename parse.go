@@ -279,8 +279,40 @@ func parseProfileSpec(name string) ProfileLimits {
 func normalizeToken(token string) string {
 	t := strings.ToLower(strings.TrimSpace(token))
 	t = strings.ReplaceAll(t, " ", "")
+	t = strings.ReplaceAll(t, ",", "")
 	t = strings.ReplaceAll(t, "/s", "")
 	return t
+}
+
+// parseValidity interprets the remaining validity reported by the portal. The
+// value is either a formatted duration ("2d 5h"), an absolute timestamp, the
+// word unlimited, or "0"/"-" for a profile that is already used up.
+func parseValidity(value string, now time.Time) (seconds int64, unlimited bool, ok bool) {
+	text := strings.TrimSpace(value)
+	if text == "" || text == "..." {
+		return 0, false, false
+	}
+	if unlimitedTokens[normalizeToken(text)] {
+		return 0, true, true
+	}
+	if text == "-" {
+		return 0, false, true
+	}
+	normalized := normalizeToken(text)
+	if normalized == "0" || normalized == "0s" || normalized == "00:00:00" {
+		return 0, false, true
+	}
+	if timestamp, ok := parseUMTimestamp(text); ok {
+		delta := int64(timestamp.Sub(now).Seconds())
+		if delta < 0 {
+			delta = 0
+		}
+		return delta, false, true
+	}
+	if seconds, _, ok := parseTimeSpan(text); ok {
+		return seconds, false, true
+	}
+	return 0, false, false
 }
 
 // parseUMTimestamp reads a User Manager timestamp such as

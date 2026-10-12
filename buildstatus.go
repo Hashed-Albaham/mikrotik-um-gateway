@@ -5,351 +5,294 @@ import (
 	"time"
 )
 
-// portalData carries the three concurrent User Manager responses.
-type portalData struct {
-	user         any // GET /um/api/getUser
-	userProfiles any // GET /um/api/getUserProfiles
-	profiles     any // GET /um/api/getProfiles
-}
-
 // Where the plan limits of an account came from. Reported so callers know how
 // much to trust the computed balances.
 const (
-	limitsSourceRecord = "profile-record-limits"
-	limitsSourceName   = "profile-name-syntax"
-	limitsSourceNone   = "unavailable"
+	limitsSourceName = "profile-name-syntax"
+	limitsSourceNone = "unavailable"
 )
 
-// buildStatus turns the raw portal responses of one account into the public
-// payload: used versus allowed data, remaining uptime, validity and state.
-func buildStatus(user string, data portalData, now time.Time) statusResponse {
+// stateExpired is the numeric profile state User Manager reports for a profile
+// that has been used up ("used" in the RouterOS menu).
+const stateExpired = 3
+
+// statusResponse is the public JSON payload. Every balance is exposed twice:
+// as a short human readable string for direct rendering, and as an exact number
+// inside "raw" for machines.
+type statusResponse struct {
+	Success bool `json:"success"`
+
+	MaskedUsername string `json:"masked_username"`
+	MaskedUser     string `json:"masked_user"`
+
+	ProfileName       string `json:"profile_name,omitempty"`
+	ProfileState      string `json:"profile_state"`
+	DataLeft          string `json:"data_left"`
+	TotalData         string `json:"total_data"`
+	TimeLeft          string `json:"time_left"`
+	TotalTime         string `json:"total_time"`
+	TotalValidity     string `json:"total_validity"`
+	RemainingValidity string `json:"remaining_validity"`
+
+	UsedDownload string `json:"used_download"`
+	UsedUpload   string `json:"used_upload"`
+	UsedUptime   string `json:"used_uptime"`
+
+	Sessions       sessionDetails `json:"sessions"`
+	ActiveSessions int            `json:"active_sessions"`
+	SharedUsers    int            `json:"shared_users"`
+
+	Raw rawValues `json:"raw"`
+
+	LimitsSource   string   `json:"limits_source,omitempty"`
+	ValidityEndsAt string   `json:"validity_ends_at,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
+	GeneratedAt    string   `json:"generated_at"`
+}
+
+// sessionDetails groups the session counters, matching the shape hotspot pages
+// already expect.
+type sessionDetails struct {
+	ActiveSessions int `json:"active_sessions"`
+	SharedUsers    int `json:"shared_users"`
+}
+
+// rawValues carries the exact numbers behind the human readable fields. A value
+// of -1 means unlimited.
+type rawValues struct {
+	DownloadBytes            int64 `json:"download_bytes"`
+	UploadBytes              int64 `json:"upload_bytes"`
+	UsedDataBytes            int64 `json:"used_data_bytes"`
+	UptimeSeconds            int64 `json:"uptime_seconds"`
+	DataLeftBytes            int64 `json:"data_left_bytes"`
+	TotalDataBytes           int64 `json:"total_data_bytes"`
+	TimeLeftSeconds          int64 `json:"time_left_seconds"`
+	TotalTimeSeconds         int64 `json:"total_time_seconds"`
+	RemainingValiditySeconds int64 `json:"remaining_validity_seconds"`
+	DataUnlimited            bool  `json:"data_unlimited"`
+	TimeUnlimited            bool  `json:"time_unlimited"`
+}
+
+const (
+	unlimitedText = "unlimited"
+	unknownText   = "unknown"
+)
+
+// buildStatus turns the portal snapshot of one account into the public payload.
+func buildStatus(user string, data UserData, profiles []ProfileEntry, now time.Time) statusResponse {
+	account := strings.TrimSpace(data.Username)
+	if account == "" {
+		account = user
+	}
+	masked := maskUser(account)
+
 	response := statusResponse{
-		Success:     true,
-		MaskedUser:  maskUser(user),
-		GeneratedAt: now.UTC().Format(time.RFC3339),
+		Success:        true,
+		MaskedUsername: masked,
+		MaskedUser:     masked,
+		GeneratedAt:    now.UTC().Format(time.RFC3339),
+		ProfileState:   "unknown",
 	}
 
-	userRecord, hasUser := findUserRecord(data.user, user)
-	if !hasUser {
-		userRecord, hasUser = findUserRecord(data.userProfiles, user)
-	}
-	if !hasUser {
-		response.Warnings = append(response.Warnings, "the portal did not return a record for this account")
-	}
-	if userRecord == nil {
-		userRecord = map[string]any{}
-	}
-
-	profileRecord, hasProfileRecord := findProfileRecord(data.userProfiles, user)
-	profileName := resolveProfileName(userRecord, profileRecord)
-	if profileName != "" {
-		response.Profile = profileName
-	}
-
-	// --- usage ---------------------------------------------------------------
-	downloadUsed, hasDownload := usageValue(userRecord, data.user, "download-used", "downloads", "total-download", "download", "bytes-in")
-	uploadUsed, hasUpload := usageValue(userRecord, data.user, "upload-used", "uploads", "total-upload", "upload", "bytes-out")
-	if !hasDownload && !hasUpload {
+	// --- counters ------------------------------------------------------------
+	usedData := data.DownloadBytes + data.UploadBytes
+	if data.HasDownload || data.HasUpload {
+		response.UsedDownload = data.DownloadText
+		response.UsedUpload = data.UploadText
+		if response.UsedDownload == "" && data.HasDownload {
+			response.UsedDownload = formatBytes(data.DownloadBytes)
+		}
+		if response.UsedUpload == "" && data.HasUpload {
+			response.UsedUpload = formatBytes(data.UploadBytes)
+		}
+		response.Raw.DownloadBytes = data.DownloadBytes
+		response.Raw.UploadBytes = data.UploadBytes
+		response.Raw.UsedDataBytes = usedData
+	} else {
+		response.UsedDownload = unknownText
+		response.UsedUpload = unknownText
 		response.Warnings = append(response.Warnings, "the portal did not report traffic counters for this account")
 	}
-	dataUsed := downloadUsed + uploadUsed
-	if dataUsed > 0 {
-		quantity := bytesQuantity(dataUsed, false)
-		response.DataUsed = &quantity
+
+	if data.HasUptime {
+		response.UsedUptime = data.UptimeText
+		if response.UsedUptime == "" {
+			response.UsedUptime = formatDuration(data.UptimeSeconds)
+		}
+		response.Raw.UptimeSeconds = data.UptimeSeconds
+	} else {
+		response.UsedUptime = unknownText
 	}
 
-	uptimeUsed, hasUptime := usageValue(userRecord, data.user, "uptime", "uptime-used", "total-uptime", "time-used", "used-time", "session-time")
-	if hasUptime {
-		quantity := secondsQuantity(uptimeUsed, false)
-		response.TimeUsed = &quantity
+	response.ActiveSessions = data.ActiveSessions
+	response.SharedUsers = data.SharedUsers
+	response.Sessions = sessionDetails{ActiveSessions: data.ActiveSessions, SharedUsers: data.SharedUsers}
+	if !data.HasSessions {
+		response.Warnings = append(response.Warnings, "the portal did not report the active session count")
 	}
 
-	// --- plan limits ---------------------------------------------------------
-	limits, source, limitsKnown := resolveLimits(profileRecord, profileName)
-	response.LimitsSource = source
-	if !limitsKnown {
-		response.Warnings = append(response.Warnings, "the plan limits of this profile could not be resolved; profile name should look like 1000-1G-8h")
+	// --- the profile that is currently in use --------------------------------
+	profile, hasProfile := selectProfile(profiles, now)
+	limits := ProfileLimits{}
+	limitsKnown := false
+	if hasProfile {
+		response.ProfileName = profile.Name
+		limits = parseProfileSpec(profile.Name)
+		limitsKnown = limits.ParsedFields > 0
+		if profile.HasExpiry {
+			if seconds, unlimited, ok := parseValidity(profile.ExpAfter, now); ok {
+				response.Raw.RemainingValiditySeconds = seconds
+				if unlimited {
+					response.RemainingValidity = unlimitedText
+				} else {
+					response.RemainingValidity = formatDuration(seconds)
+					if ends, ok := parseUMTimestamp(profile.ExpAfter); ok {
+						response.ValidityEndsAt = ends.UTC().Format(time.RFC3339)
+					}
+				}
+			} else {
+				response.RemainingValidity = profile.ExpAfter
+			}
+		}
+		expired := profileExpired(profile, now)
+		if expired {
+			response.ProfileState = "expired"
+		} else {
+			response.ProfileState = "active"
+		}
+	} else {
+		response.Warnings = append(response.Warnings, "the portal did not return a profile assignment for this account")
+	}
+
+	if limitsKnown {
+		response.LimitsSource = limitsSourceName
+	} else {
+		response.LimitsSource = limitsSourceNone
+		if hasProfile {
+			response.Warnings = append(response.Warnings, "the plan limits could not be resolved from the profile name; a profile name such as 1000-1G-8h is expected")
+		}
 	}
 
 	// --- data balance --------------------------------------------------------
 	switch {
 	case limitsKnown && limits.DataUnlimit:
-		response.DataLeft = bytesQuantity(0, true)
+		response.DataLeft = unlimitedText
+		response.TotalData = unlimitedText
+		response.Raw.DataUnlimited = true
+		response.Raw.DataLeftBytes = -1
+		response.Raw.TotalDataBytes = -1
 	case limitsKnown:
-		remaining := limits.DataTotal - dataUsed
+		remaining := limits.DataTotal - usedData
 		if remaining < 0 {
 			remaining = 0
 		}
-		response.DataLeft = bytesQuantity(remaining, false)
+		response.DataLeft = formatBytes(remaining)
+		response.TotalData = formatBytes(limits.DataTotal)
+		response.Raw.DataLeftBytes = remaining
+		response.Raw.TotalDataBytes = limits.DataTotal
 	default:
-		response.DataLeft = Quantity{Unit: "bytes", Raw: 0, Human: "unknown"}
+		response.DataLeft = unknownText
+		response.TotalData = unknownText
 	}
 
-	// --- validity ------------------------------------------------------------
-	endTime, hasEndTime := recordTime(profileRecord, "end-time", "ends-at", "expires", "expiry", "valid-until")
-	if hasEndTime {
-		response.ValidityEndsAt = endTime.UTC().Format(time.RFC3339)
-	}
-
-	totalValidityKnown := limitsKnown
-	if totalValidityKnown {
-		response.TotalValidity = secondsQuantity(limits.TimeTotal, limits.TimeUnlimit)
-	} else {
-		response.TotalValidity = Quantity{Unit: "seconds", Raw: 0, Human: "unknown"}
-	}
-
+	// --- time balance --------------------------------------------------------
 	switch {
 	case limitsKnown && limits.TimeUnlimit:
-		response.TimeLeft = secondsQuantity(0, true)
-		response.RemainingValidity = secondsQuantity(0, true)
-	case hasEndTime:
-		seconds := int64(endTime.Sub(now).Seconds())
-		if seconds < 0 {
-			seconds = 0
-		}
-		response.RemainingValidity = secondsQuantity(seconds, false)
-		response.TimeLeft = secondsQuantity(seconds, false)
+		response.TimeLeft = unlimitedText
+		response.TotalTime = unlimitedText
+		response.TotalValidity = unlimitedText
+		response.Raw.TimeUnlimited = true
+		response.Raw.TimeLeftSeconds = -1
+		response.Raw.TotalTimeSeconds = -1
 	case limitsKnown:
-		remaining := limits.TimeTotal - uptimeUsed
+		remaining := limits.TimeTotal - data.UptimeSeconds
 		if remaining < 0 {
 			remaining = 0
 		}
-		response.TimeLeft = secondsQuantity(remaining, false)
-		response.RemainingValidity = secondsQuantity(remaining, false)
+		response.TimeLeft = formatDuration(remaining)
+		response.TotalTime = formatDuration(limits.TimeTotal)
+		response.TotalValidity = response.TotalTime
+		response.Raw.TimeLeftSeconds = remaining
+		response.Raw.TotalTimeSeconds = limits.TimeTotal
 	default:
-		response.TimeLeft = Quantity{Unit: "seconds", Raw: 0, Human: "unknown"}
-		response.RemainingValidity = Quantity{Unit: "seconds", Raw: 0, Human: "unknown"}
+		response.TimeLeft = unknownText
+		response.TotalTime = unknownText
+		response.TotalValidity = unknownText
 	}
 
-	// --- state and sessions --------------------------------------------------
-	state, hasState := recordString(profileRecord, "state", "status", "profile-state")
-	response.ProfileState = normalizeProfileState(state)
-	if !hasState || response.ProfileState == "unknown" {
-		switch {
-		case hasEndTime && endTime.Before(now):
-			response.ProfileState = "expired"
-		case hasEndTime:
-			response.ProfileState = "active"
+	// The portal expiry is the authoritative remaining validity; the plan
+	// arithmetic above is the fallback when the portal did not send one.
+	if response.RemainingValidity == "" {
+		if data.HasUptime && limitsKnown && !limits.TimeUnlimit {
+			remaining := limits.TimeTotal - data.UptimeSeconds
+			if remaining < 0 {
+				remaining = 0
+			}
+			response.RemainingValidity = formatDuration(remaining)
+			response.Raw.RemainingValiditySeconds = remaining
+		} else if response.TimeLeft != unknownText {
+			response.RemainingValidity = response.TimeLeft
+			response.Raw.RemainingValiditySeconds = response.Raw.TimeLeftSeconds
+		} else {
+			response.RemainingValidity = unknownText
 		}
 	}
-	if response.ProfileState == "unknown" {
-		response.Warnings = append(response.Warnings, "the profile state was not reported by the portal")
-	}
-
-	sessions, hasSessions := sessionCount(data.user, data.userProfiles)
-	if hasSessions {
-		response.ActiveSessions = sessions
-	} else {
-		response.Warnings = append(response.Warnings, "the active session count was not reported by the portal")
-	}
-
-	if !hasProfileRecord {
-		response.Warnings = append(response.Warnings, "no user-profile assignment record was found for this account")
+	if response.ProfileState == "expired" {
+		response.TimeLeft = "0s"
+		response.RemainingValidity = "0s"
+		response.Raw.TimeLeftSeconds = 0
+		response.Raw.RemainingValiditySeconds = 0
 	}
 	return response
 }
 
-// usageValue reads a counter from the user record, then from the whole user
-// payload as a fallback, because some builds nest counters under a "monitor"
-// sub-object.
-func usageValue(record map[string]any, payload any, aliases ...string) (int64, bool) {
-	if record != nil {
-		if value, ok := firstOf(record, aliases...); ok {
-			if parsed, ok := toInt64(value); ok {
-				return parsed, true
-			}
+// selectProfile picks the profile that is in use. Profiles that are used up are
+// skipped when a usable one exists, because a single account can hold several
+// profiles and only one of them is active at a time.
+func selectProfile(profiles []ProfileEntry, now time.Time) (ProfileEntry, bool) {
+	if len(profiles) == 0 {
+		return ProfileEntry{}, false
+	}
+	// Prefer a usable profile that also names a plan.
+	for _, entry := range profiles {
+		if entry.Name != "" && !profileExpired(entry, now) {
+			return entry, true
 		}
 	}
-	if value, ok := firstOf(payload, aliases...); ok {
-		if parsed, ok := toInt64(value); ok {
-			return parsed, true
+	for _, entry := range profiles {
+		if !profileExpired(entry, now) {
+			return entry, true
 		}
 	}
-	return 0, false
+	for _, entry := range profiles {
+		if entry.Name != "" {
+			return entry, true
+		}
+	}
+	return profiles[0], true
 }
 
-// resolveProfileName finds the profile currently assigned to the account.
-func resolveProfileName(userRecord, profileRecord map[string]any) string {
-	aliases := []string{"actual-profile", "profile", "user-profile", "profile-name", "actualprofile"}
-	if name, ok := recordString(userRecord, aliases...); ok && name != "" {
-		return name
+// profileExpired decides whether a profile is used up: state 3 in the portal
+// means "used", and an expiry that has already elapsed does the same.
+func profileExpired(entry ProfileEntry, now time.Time) bool {
+	switch {
+	case entry.StateValue == stateExpired:
+		return true
+	case entry.StateValue > 0:
+		return false
 	}
-	if name, ok := recordString(profileRecord, aliases...); ok && name != "" {
-		return name
-	}
-	return ""
-}
-
-// resolveLimits determines the plan allowance. Explicit numeric limits in the
-// profile record win; otherwise the limits encoded in the profile name are used.
-// RouterOS stores 0 in limit fields when no limit is configured, so zero values
-// are treated as "not set" and fall through to the name syntax.
-func resolveLimits(profileRecord map[string]any, profileName string) (ProfileLimits, string, bool) {
-	if profileRecord != nil {
-		limits := ProfileLimits{Raw: profileName}
-		known := false
-
-		if total, unlimited, ok := positiveLimit(profileRecord, "transfer-limit", "total-limit", "data-limit", "bytes-limit"); ok {
-			limits.DataTotal, limits.DataUnlimit, known = total, unlimited, true
-		} else if down, _, okDown := positiveLimit(profileRecord, "download-limit"); okDown {
-			up, _, okUp := positiveLimit(profileRecord, "upload-limit")
-			if okUp {
-				limits.DataTotal = down + up
-			} else {
-				limits.DataTotal = down
-			}
-			known = true
-		}
-
-		if total, unlimited, ok := positiveLimit(profileRecord, "validity", "uptime-limit", "time-limit", "limit-uptime"); ok {
-			limits.TimeTotal, limits.TimeUnlimit, known = total, unlimited, true
-		}
-
-		if known {
-			if price, ok := toFloat(anyOf(profileRecord, "price")); ok {
-				limits.Price, limits.HasPrice = price, true
-			}
-			return limits, limitsSourceRecord, true
+	if text, ok := entry.State.(string); ok {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "used", "expired", "stopped", "disabled":
+			return true
+		case "running", "running active", "active":
+			return false
 		}
 	}
-
-	parsed := parseProfileSpec(profileName)
-	if parsed.ParsedFields > 0 {
-		return parsed, limitsSourceName, true
-	}
-	return ProfileLimits{Raw: profileName}, limitsSourceNone, false
-}
-
-// positiveLimit reads one limit field and treats 0 and empty values as unset.
-func positiveLimit(record map[string]any, aliases ...string) (int64, bool, bool) {
-	value, ok := firstOf(record, aliases...)
-	if !ok {
-		return 0, false, false
-	}
-	if text, ok := value.(string); ok && unlimitedTokens[normalizeToken(text)] {
-		return 0, true, true
-	}
-	parsed, ok := toInt64(value)
-	if !ok || parsed <= 0 {
-		return 0, false, false
-	}
-	return parsed, false, true
-}
-
-func anyOf(record map[string]any, aliases ...string) any {
-	value, _ := firstOf(record, aliases...)
-	return value
-}
-
-// recordString returns the first string value for the given key aliases.
-func recordString(record map[string]any, aliases ...string) (string, bool) {
-	if record == nil {
-		return "", false
-	}
-	value, ok := firstOf(record, aliases...)
-	if !ok {
-		return "", false
-	}
-	text, ok := toString(value)
-	return strings.TrimSpace(text), ok
-}
-
-// recordTime parses the first parseable timestamp among the key aliases.
-func recordTime(record map[string]any, aliases ...string) (time.Time, bool) {
-	if record == nil {
-		return time.Time{}, false
-	}
-	values := collect(record, aliases...)
-	for _, value := range values {
-		text, ok := toString(value)
-		if !ok {
-			continue
-		}
-		if parsed, ok := parseUMTimestamp(text); ok {
-			return parsed, true
+	if entry.HasExpiry {
+		if seconds, unlimited, ok := parseValidity(entry.ExpAfter, now); ok {
+			return !unlimited && seconds <= 0
 		}
 	}
-	return time.Time{}, false
-}
-
-// normalizeProfileState maps the User Manager states onto the two states the
-// API contract exposes: active and expired.
-func normalizeProfileState(state string) string {
-	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "running active", "running-active", "running", "active":
-		return "active"
-	case "used", "expired", "stopped", "disabled":
-		return "expired"
-	default:
-		return "unknown"
-	}
-}
-
-// findProfileRecord locates the user-profile assignment row of an account.
-func findProfileRecord(payload any, user string) (map[string]any, bool) {
-	record, ok := findUserRecord(payload, user)
-	if !ok {
-		return nil, false
-	}
-	if _, ok := firstOf(record, "profile", "user-profile", "profile-name"); !ok {
-		return nil, false
-	}
-	return record, true
-}
-
-// sessionCount prefers an explicit counter and falls back to counting the
-// session rows that are marked active.
-func sessionCount(payloads ...any) (int, bool) {
-	for _, payload := range payloads {
-		if value, ok := firstOf(payload, "active-sessions", "active-session-count", "activeSessions", "sessions-count"); ok {
-			if parsed, ok := toInt64(value); ok {
-				return int(parsed), true
-			}
-		}
-	}
-	for _, payload := range payloads {
-		if count, ok := countActiveSessionRows(payload); ok {
-			return count, true
-		}
-	}
-	return 0, false
-}
-
-// countActiveSessionRows walks the payload for a list of session objects and
-// counts those whose active flag is set.
-func countActiveSessionRows(payload any) (int, bool) {
-	found := false
-	count := 0
-
-	var walk func(node any, depth int)
-	walk = func(node any, depth int) {
-		if depth > maxJSONDepth || node == nil {
-			return
-		}
-		switch typed := node.(type) {
-		case []any:
-			for _, item := range typed {
-				record, ok := item.(map[string]any)
-				if !ok {
-					walk(item, depth+1)
-					continue
-				}
-				value, ok := firstOf(record, "active", "is-active")
-				if !ok {
-					walk(record, depth+1)
-					continue
-				}
-				found = true
-				if flag, ok := toBool(value); ok && flag {
-					count++
-				}
-			}
-		case map[string]any:
-			for _, value := range typed {
-				walk(value, depth+1)
-			}
-		}
-	}
-	walk(payload, 0)
-	return count, found
+	return false
 }
