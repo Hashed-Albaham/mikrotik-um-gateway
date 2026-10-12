@@ -1,453 +1,687 @@
-// Command um-status-gateway exposes a small, on-demand HTTP API in front of the
-// MikroTik RouterOS v7 User Manager web portal (/um/).
+// خدمة صغيرة تعمل عند الطلب فقط: تقرأ بيانات الكرت من بوابة User Manager في
+// MikroTik RouterOS v7 وتعيد الرصيد المتبقي والوقت والصلاحية بصيغة JSON.
 //
-// The gateway is deliberately stateless and event driven: it opens a portal
-// session only when an HTTP request arrives, reads the quota, validity and
-// session data for one account, computes the remaining balances, masks the
-// account identifier, schedules a delayed logout, and answers with JSON.
-// It never runs a polling loop, a cache warmer or a shared session.
+// لا حلقات خلفية ولا ذاكرة مؤقتة: كل طلب يفتح جلسة خاصة به، يقرأ البيانات في
+// طلبين متوازيين، يحسب المتبقي، ثم يغلق الجلسة بعد مدة قصيرة قابلة للضبط.
+// كل الإعدادات تُقرأ من متغيرات البيئة: العنوان، البروتوكول، البورت، المنفذ.
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"os/signal"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
-// Environment variables. Either UM_TARGET_URL or UM_HOST is mandatory;
-// everything else has a documented default so the container can be started with
-// plain defaults.
-const (
-	envUMTargetURL   = "UM_TARGET_URL"
-	envUMHost        = "UM_HOST"
-	envUMProto       = "UM_PROTO"
-	envUMPort        = "UM_PORT"
-	envUMSkipVerify  = "UM_INSECURE_SKIP_VERIFY"
-	envListenAddr    = "LISTEN_ADDR"
-	envPort          = "PORT"
-	envLogoutDelay   = "LOGOUT_DELAY_SECONDS"
-	envRequestTimout = "REQUEST_TIMEOUT_SECONDS"
-	envAllowedOrigin = "ALLOWED_ORIGIN"
-	envReleaseMemory = "RELEASE_MEMORY_ON_SESSION_END"
+// ---------------------------------------------------------------------------
+// الإعدادات
+// ---------------------------------------------------------------------------
 
-	defaultListenAddr      = ":8080"
-	defaultLogoutDelaySecs = 60
-	defaultRequestTimeout  = 6 * time.Second
-	defaultAllowedOrigin   = "*"
-	logoutCallTimeout      = 20 * time.Second
-	maxRequestBodyBytes    = 1 << 10
-)
-
-// config holds the runtime configuration of the gateway.
 type config struct {
-	umHost         string
-	listenAddr     string
-	logoutDelay    time.Duration
-	requestTimeout time.Duration
-	allowedOrigin  string
-	releaseMemory  bool
-	skipTLSVerify  bool
+	portalURL   string        // عنوان بوابة اليوزر منجر
+	listenAddr  string        // منفذ الخدمة المحلية
+	logoutDelay time.Duration // التأخير قبل إغلاق جلسة البوابة
+	timeout     time.Duration // مهلة تسجيل الدخول والقراءة
 }
 
-// loadConfig reads the environment and validates it.
-func loadConfig() (config, error) {
-	cfg := config{
-		listenAddr:     strings.TrimSpace(os.Getenv(envListenAddr)),
-		logoutDelay:    defaultLogoutDelaySecs * time.Second,
-		requestTimeout: defaultRequestTimeout,
-		allowedOrigin:  defaultAllowedOrigin,
-		releaseMemory:  true,
-		skipTLSVerify:  true,
-	}
+var cfg = loadConfig()
 
-	baseURL, err := resolveUMBaseURL()
-	if err != nil {
-		return config{}, err
+func env(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
 	}
-	cfg.umHost = baseURL
-
-	if cfg.listenAddr == "" {
-		cfg.listenAddr = defaultListenAddr
-		if raw := strings.TrimSpace(os.Getenv(envPort)); raw != "" {
-			port, err := strconv.Atoi(raw)
-			if err != nil || port <= 0 || port > 65535 {
-				return config{}, fmt.Errorf("%s must be a valid TCP port, got %q", envPort, raw)
-			}
-			cfg.listenAddr = ":" + raw
-		}
-	}
-	if origin := strings.TrimSpace(os.Getenv(envAllowedOrigin)); origin != "" {
-		cfg.allowedOrigin = origin
-	}
-	if raw := strings.TrimSpace(os.Getenv(envLogoutDelay)); raw != "" {
-		seconds, err := strconv.Atoi(raw)
-		if err != nil || seconds < 0 {
-			return config{}, fmt.Errorf("%s must be a non-negative integer, got %q", envLogoutDelay, raw)
-		}
-		cfg.logoutDelay = time.Duration(seconds) * time.Second
-	}
-	if raw := strings.TrimSpace(os.Getenv(envRequestTimout)); raw != "" {
-		seconds, err := strconv.Atoi(raw)
-		if err != nil || seconds <= 0 {
-			return config{}, fmt.Errorf("%s must be a positive integer, got %q", envRequestTimout, raw)
-		}
-		cfg.requestTimeout = time.Duration(seconds) * time.Second
-	}
-	if raw := strings.TrimSpace(os.Getenv(envReleaseMemory)); raw != "" {
-		enabled, err := strconv.ParseBool(raw)
-		if err != nil {
-			return config{}, fmt.Errorf("%s must be a boolean, got %q", envReleaseMemory, raw)
-		}
-		cfg.releaseMemory = enabled
-	}
-	if raw := strings.TrimSpace(os.Getenv(envUMSkipVerify)); raw != "" {
-		enabled, err := strconv.ParseBool(raw)
-		if err != nil {
-			return config{}, fmt.Errorf("%s must be a boolean, got %q", envUMSkipVerify, raw)
-		}
-		cfg.skipTLSVerify = enabled
-	}
-	return cfg, nil
+	return fallback
 }
 
-// resolveUMBaseURL builds the portal base URL from either a full URL or from
-// the protocol, host and port parts.
-func resolveUMBaseURL() (string, error) {
-	if raw := strings.TrimSpace(os.Getenv(envUMTargetURL)); raw != "" {
-		return normalizeBaseURL(raw)
+func envSeconds(key, fallback string) time.Duration {
+	number, err := strconv.Atoi(env(key, fallback))
+	if err != nil || number < 0 {
+		number, _ = strconv.Atoi(fallback)
 	}
-
-	host := strings.TrimSpace(os.Getenv(envUMHost))
-	if host == "" {
-		return "", fmt.Errorf("%s or %s is required (for example %s=http://192.168.88.1)", envUMTargetURL, envUMHost, envUMHost)
-	}
-	if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
-		return normalizeBaseURL(host)
-	}
-
-	proto := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv(envUMProto)), "://"))
-	if proto == "" {
-		proto = "http"
-	}
-	if proto != "http" && proto != "https" {
-		return "", fmt.Errorf("%s must be http or https, got %q", envUMProto, proto)
-	}
-	host = strings.Trim(host, "/")
-	if port := strings.TrimSpace(os.Getenv(envUMPort)); port != "" {
-		if _, err := strconv.Atoi(port); err != nil || port == "" {
-			return "", fmt.Errorf("%s must be a valid TCP port, got %q", envUMPort, port)
-		}
-		if !strings.Contains(host, ":") {
-			host += ":" + port
-		}
-	}
-	return normalizeBaseURL(proto + "://" + host)
+	return time.Duration(number) * time.Second
 }
 
-// normalizeBaseURL validates a base URL and removes a trailing slash.
-func normalizeBaseURL(raw string) (string, error) {
-	base := strings.TrimRight(strings.TrimSpace(raw), "/")
-	if base == "" {
-		return "", fmt.Errorf("user manager base URL is empty")
+func loadConfig() config {
+	// العنوان: إما UM_TARGET_URL كاملاً، أو UM_PROTO + UM_HOST + UM_PORT.
+	target := strings.TrimSpace(os.Getenv("UM_TARGET_URL"))
+	if target == "" {
+		target = fmt.Sprintf("%s://%s:%s",
+			strings.ToLower(env("UM_PROTO", "http")),
+			env("UM_HOST", "192.168.216.1"),
+			env("UM_PORT", "12008"))
 	}
-	parsed, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("invalid user manager base URL: %w", err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("user manager base URL must use http or https, got %q", base)
-	}
-	if parsed.Host == "" {
-		return "", fmt.Errorf("user manager base URL has no host: %q", base)
-	}
-	return base, nil
-}
-
-// errorResponse is returned for every failure, with a stable machine readable
-// code so callers can branch without parsing prose.
-type errorResponse struct {
-	Success bool   `json:"success"`
-	Code    string `json:"code"`
-	Error   string `json:"error"`
-}
-
-// server wires the configuration into an http.Handler.
-type server struct {
-	cfg config
-}
-
-func main() {
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("configuration error: %v", err)
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		target = "http://" + target
 	}
 
-	srv := &server{cfg: cfg}
-
-	httpServer := &http.Server{
-		Addr:              cfg.listenAddr,
-		Handler:           srv.routes(),
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      cfg.requestTimeout + 10*time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    16 << 10,
+	// منفذ الخدمة: LISTEN_ADDR أولاً، ثم PORT.
+	listen := env("LISTEN_ADDR", "")
+	if listen == "" {
+		listen = ":" + env("PORT", "8080")
 	}
 
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
-
-	errCh := make(chan error, 1)
-	go func() {
-		log.Printf("um-status-gateway listening on %s (user manager: %s, logout delay: %s)",
-			cfg.listenAddr, cfg.umHost, cfg.logoutDelay)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	}()
-
-	select {
-	case err := <-errCh:
-		log.Fatalf("server error: %v", err)
-	case sig := <-shutdown:
-		log.Printf("received %s, shutting down", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(ctx); err != nil {
-			log.Printf("graceful shutdown failed: %v", err)
-		}
+	return config{
+		portalURL:   strings.TrimRight(target, "/"),
+		listenAddr:  listen,
+		logoutDelay: envSeconds("LOGOUT_DELAY_SECONDS", "60"),
+		timeout:     envSeconds("REQUEST_TIMEOUT_SECONDS", "8"),
 	}
 }
 
-// routes builds the HTTP routing table wrapped in the CORS middleware.
-// "/api/status" and "/api/user-status" are the same handler under two names so
-// existing hotspot pages keep working.
-func (s *server) routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/status", s.handleStatus)
-	mux.HandleFunc("POST /api/status", s.handleStatus)
-	mux.HandleFunc("OPTIONS /api/status", s.handlePreflight)
-	mux.HandleFunc("GET /api/user-status", s.handleStatus)
-	mux.HandleFunc("POST /api/user-status", s.handleStatus)
-	mux.HandleFunc("OPTIONS /api/user-status", s.handlePreflight)
-	mux.HandleFunc("GET /healthz", s.handleHealth)
-	mux.HandleFunc("GET /", s.handleIndex)
-	return s.withCORS(mux)
+// ---------------------------------------------------------------------------
+// أشكال الاستجابة: ما يخرج للعميل، وما يصل من البوابة.
+// ---------------------------------------------------------------------------
+
+type statusResponse struct {
+	Success           bool   `json:"success"`
+	MaskedUsername    string `json:"masked_username"`
+	ProfileName       string `json:"profile_name,omitempty"`
+	ProfileState      string `json:"profile_state"`
+	DataLeft          string `json:"data_left"`
+	TotalData         string `json:"total_data"`
+	TimeLeft          string `json:"time_left"`
+	TotalTime         string `json:"total_time"`
+	RemainingValidity string `json:"remaining_validity"`
+	UsedDownload      string `json:"used_download"`
+	UsedUpload        string `json:"used_upload"`
+	UsedUptime        string `json:"used_uptime"`
+	ActiveSessions    int    `json:"active_sessions"`
+	SharedUsers       int    `json:"shared_users"`
+	Error             string `json:"error,omitempty"`
 }
 
-// withCORS adds the CORS headers required by browser based hotspot pages.
-func (s *server) withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", s.cfg.allowedOrigin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Max-Age", "600")
-		w.Header().Set("Vary", "Origin")
-		next.ServeHTTP(w, r)
-	})
+// GET /um/api/getUser
+type accountResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Username       string `json:"username"`
+		Download       string `json:"download"`
+		Upload         string `json:"upload"`
+		Uptime         string `json:"uptime"`
+		ActiveSessions int    `json:"activeSess"`
+		SharedUsers    int    `json:"sharedUsers"`
+	} `json:"data"`
 }
 
-func (s *server) handlePreflight(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusNoContent)
+type profileEntry struct {
+	Name     string          `json:"name"`
+	State    json.RawMessage `json:"state"`
+	ExpAfter string          `json:"expAfter"`
 }
 
-func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "logout_delay_seconds": int(s.cfg.logoutDelay.Seconds())})
+// GET /um/api/getUserProfiles
+type profilesResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Profiles []profileEntry `json:"profiles"`
+	} `json:"data"`
 }
 
-func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		writeError(w, http.StatusNotFound, "not_found", "unknown path")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"service": "um-status-gateway",
-		"endpoints": []string{
-			"GET|POST /api/status?user=<id>&pass=<password>",
-			"GET|POST /api/user-status?user=<id>&pass=<password>",
-			"GET /healthz",
-		},
-	})
-}
+// ---------------------------------------------------------------------------
+// المعالج: دخول، قراءتان متوازيتان، حساب، ثم إغلاق مؤجل.
+// ---------------------------------------------------------------------------
 
-// handleStatus is the only work producing endpoint. It performs the whole
-// on-demand flow for a single account and answers before the delayed logout
-// fires.
-func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
-	if err := r.ParseForm(); err != nil && !errors.Is(err, http.ErrNotMultipart) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "the request body could not be parsed")
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	user := strings.TrimSpace(firstNonEmpty(r.Form.Get("user"), r.Form.Get("username")))
-	password := firstNonEmpty(r.Form.Get("pass"), r.Form.Get("password"))
-
+	user := firstValue(r, "user", "username")
+	password := firstValue(r, "pass", "password")
 	if user == "" {
-		writeError(w, http.StatusBadRequest, "missing_user", "parameter 'user' is required")
-		return
-	}
-	if len(user) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_user", "parameter 'user' is too long")
-		return
-	}
-	if len(password) > 256 {
-		writeError(w, http.StatusBadRequest, "invalid_password", "parameter 'pass' is too long")
+		writeJSON(w, http.StatusBadRequest, statusResponse{Success: false, Error: "المرجع user مطلوب"})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.requestTimeout)
-	defer cancel()
-
-	client, err := NewClient(s.cfg.umHost, s.cfg.requestTimeout, user, s.cfg.skipTLSVerify)
+	client, err := newPortalClient()
 	if err != nil {
-		log.Printf("status user=%s failed: %v", maskUser(user), err)
-		writeError(w, http.StatusInternalServerError, "configuration_error", err.Error())
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Success: false, Error: "تعذر تهيئة عميل البوابة"})
 		return
 	}
 
-	if err := client.Login(ctx, password); err != nil {
-		if errors.Is(err, errInvalidCredentials) {
-			log.Printf("status user=%s rejected: invalid credentials", maskUser(user))
-			writeError(w, http.StatusUnauthorized, "invalid_credentials", "the user manager rejected these credentials")
-			return
-		}
-		log.Printf("status user=%s: %v", maskUser(user), err)
-		writeError(w, http.StatusBadGateway, "login_failed", "could not open a user manager session")
+	if err := login(client, user, password); err != nil {
+		log.Printf("فشل الدخول لـ %s: %v", maskUsername(user), err)
+		writeJSON(w, http.StatusUnauthorized, statusResponse{
+			Success: false, MaskedUsername: maskUsername(user), Error: err.Error(),
+		})
 		return
 	}
 
-	payloads, err := fetchAll(ctx, client)
-	if err != nil {
-		log.Printf("status user=%s fetch failed: %v", maskUser(user), err)
-		s.scheduleLogout(client)
-		writeError(w, http.StatusBadGateway, "fetch_failed", "could not read data from the user manager")
-		return
-	}
-	// The reads are done: keep the session cookie but release the sockets so a
-	// pending session does not hold buffers for the whole logout delay.
-	client.CloseIdleConnections()
-
-	response := buildStatus(user, payloads.user, payloads.profiles, time.Now())
-	writeJSON(w, http.StatusOK, response)
-
-	// The portal session is closed by a single one-shot timer, never by a loop.
-	s.scheduleLogout(client)
-	log.Printf("status user=%s state=%s data_left=%s time_left=%s",
-		response.MaskedUsername, response.ProfileState, response.DataLeft, response.TimeLeft)
-}
-
-// portalData carries the two concurrent User Manager responses.
-type portalData struct {
-	user     UserData
-	profiles []ProfileEntry
-}
-
-// fetchAll issues the two read calls concurrently and collects their results.
-// The first error is reported once both calls have finished.
-func fetchAll(ctx context.Context, client *Client) (portalData, error) {
+	// قراءتان متوازيتان: بيانات الكرت، والبروفايلات المرتبطة به.
 	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		firstErr error
-		data     portalData
+		account    accountResponse
+		profiles   profilesResponse
+		accountErr error
+		wg         sync.WaitGroup
 	)
-
-	recordErr := func(err error) {
-		if err == nil {
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		user, err := client.FetchUser(ctx)
-		recordErr(err)
-		mu.Lock()
-		data.user = user
-		mu.Unlock()
+		accountErr = getJSON(client, "/um/api/getUser", &account)
 	}()
 	go func() {
 		defer wg.Done()
-		profiles, err := client.FetchUserProfiles(ctx)
-		recordErr(err)
-		mu.Lock()
-		data.profiles = profiles
-		mu.Unlock()
+		// فشل قراءة البروفايلات لا يُفشل الطلب: يُعاد ما توفر من بيانات.
+		_ = getJSON(client, "/um/api/getUserProfiles", &profiles)
 	}()
 	wg.Wait()
 
-	if firstErr != nil {
-		return portalData{}, firstErr
-	}
-	return data, nil
-}
+	// إغلاق الاتصالات الخاملة فوراً حتى لا تبقى مفتوحة أثناء التأخير قبل الخروج.
+	client.CloseIdleConnections()
+	scheduleLogout(client, user)
 
-// scheduleLogout invalidates the portal session after the configured delay.
-// This one-shot timer is part of the required workflow; it is not a polling
-// loop and it does not keep any other state alive.
-func (s *server) scheduleLogout(client *Client) {
-	if s.cfg.logoutDelay <= 0 {
+	if accountErr != nil {
+		log.Printf("تعذر قراءة بيانات %s: %v", maskUsername(user), accountErr)
+		writeJSON(w, http.StatusBadGateway, statusResponse{
+			Success: false, MaskedUsername: maskUsername(user), Error: "تعذر قراءة البيانات من اليوزر منجر",
+		})
 		return
 	}
-	time.AfterFunc(s.cfg.logoutDelay, func() {
-		ctx, cancel := context.WithTimeout(context.Background(), logoutCallTimeout)
-		defer cancel()
-		if err := client.Logout(ctx); err != nil {
-			log.Printf("delayed logout for %s failed: %v", maskUser(client.user), err)
-		} else {
-			log.Printf("delayed logout completed for %s", maskUser(client.user))
-		}
-		// The session is over: drop its sockets and return the request's memory
-		// to the operating system. This is a one-shot step at the end of the
-		// request lifecycle, not a polling loop.
-		client.CloseIdleConnections()
-		if s.cfg.releaseMemory {
-			debug.FreeOSMemory()
-		}
-	})
+
+	response := buildResponse(user, account, profiles)
+	writeJSON(w, http.StatusOK, response)
+	log.Printf("%s: المتبقي %s / %s", response.MaskedUsername, response.DataLeft, response.TimeLeft)
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		http.Error(w, `{"success":false,"code":"encode_failed"}`, http.StatusInternalServerError)
-		return
+// أول قيمة موجودة من المرجع المطلوب، في الرابط أو في جسم الطلب.
+func firstValue(r *http.Request, keys ...string) string {
+	if err := r.ParseForm(); err != nil {
+		return ""
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
-}
-
-// writeError sends the standard error envelope. Messages never contain the
-// account identifier or the password.
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, errorResponse{Success: false, Code: code, Error: message})
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
+	for _, key := range keys {
+		if value := strings.TrimSpace(r.Form.Get(key)); value != "" {
+			return value
 		}
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// التعامل مع البوابة
+// ---------------------------------------------------------------------------
+
+func newPortalClient() (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	verify := !strings.EqualFold(env("UM_INSECURE_SKIP_VERIFY", "true"), "false")
+	return &http.Client{
+		Jar:     jar,
+		Timeout: cfg.timeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        2,
+			MaxIdleConnsPerHost: 2,
+			DisableCompression:  true,
+			// بوابة الراوتر عادةً بشهادة موقعة ذاتياً؛ UM_INSECURE_SKIP_VERIFY=false لإلزام التحقق.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: !verify}, //nolint:gosec
+		},
+	}, nil
+}
+
+func portalURL(path string) string { return cfg.portalURL + path }
+
+// تسجيل الدخول يُرسل بصيغة نموذج كما تتوقع البوابة.
+func login(client *http.Client, user, password string) error {
+	form := url.Values{"username": {user}, "password": {password}}
+	response, err := client.PostForm(portalURL("/um/api/login"), form)
+	if err != nil {
+		return fmt.Errorf("تعذر الوصول إلى البوابة")
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("بيانات الدخول غير صحيحة")
+	}
+	var result struct {
+		Success bool `json:"success"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return fmt.Errorf("رد غير مفهوم من البوابة")
+	}
+	if !result.Success {
+		return fmt.Errorf("بيانات الدخول غير صحيحة")
+	}
+	return nil
+}
+
+func getJSON(client *http.Client, path string, target any) error {
+	response, err := client.Get(portalURL(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s أعاد الرمز %d", path, response.StatusCode)
+	}
+	return json.NewDecoder(response.Body).Decode(target)
+}
+
+// إغلاق الجلسة بعد مدة قصيرة، بمؤقت واحد فقط لكل طلب.
+func scheduleLogout(client *http.Client, user string) {
+	if cfg.logoutDelay <= 0 {
+		return
+	}
+	time.AfterFunc(cfg.logoutDelay, func() {
+		body := strings.NewReader(url.Values{"username": {user}}.Encode())
+		request, err := http.NewRequest(http.MethodPost, portalURL("/um/api/logout"), body)
+		if err == nil {
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if response, err := client.Do(request.WithContext(ctx)); err == nil {
+				_ = response.Body.Close()
+			}
+		}
+		client.CloseIdleConnections()
+	})
+}
+
+// ---------------------------------------------------------------------------
+// الحساب
+// ---------------------------------------------------------------------------
+
+func buildResponse(user string, account accountResponse, profiles profilesResponse) statusResponse {
+	download := parseSize(account.Data.Download)
+	upload := parseSize(account.Data.Upload)
+	uptime := parseSpan(account.Data.Uptime)
+
+	response := statusResponse{
+		Success:        true,
+		MaskedUsername: maskUsername(firstNonEmpty(account.Data.Username, user)),
+		ProfileState:   "غير معروف",
+		UsedDownload:   account.Data.Download,
+		UsedUpload:     account.Data.Upload,
+		UsedUptime:     account.Data.Uptime,
+		ActiveSessions: account.Data.ActiveSessions,
+		SharedUsers:    account.Data.SharedUsers,
+	}
+
+	// يُفضَّل أول بروفايل غير منتهٍ، لأن الكرت قد يحمل أكثر من بروفايل.
+	profile, expired := selectProfile(profiles.Data.Profiles)
+	response.ProfileName = profile.Name
+	switch {
+	case expired:
+		response.ProfileState = "منتهي"
+	case profile.Name != "":
+		response.ProfileState = "نشط"
+	}
+
+	dataLimit, dataUnlimited, timeLimit, timeUnlimited := parsePlan(profile.Name)
+
+	switch {
+	case dataUnlimited:
+		response.DataLeft, response.TotalData = "غير محدود", "غير محدود"
+	case dataLimit > 0:
+		response.DataLeft = formatBytes(remaining(dataLimit, download+upload))
+		response.TotalData = formatBytes(dataLimit)
+	default:
+		response.DataLeft, response.TotalData = "غير معروف", "غير معروف"
+	}
+
+	switch {
+	case timeUnlimited:
+		response.TimeLeft, response.TotalTime = "غير محدود", "غير محدود"
+	case timeLimit > 0:
+		response.TimeLeft = formatSpan(remaining(timeLimit, uptime))
+		response.TotalTime = formatSpan(timeLimit)
+	default:
+		response.TimeLeft, response.TotalTime = "غير معروف", "غير معروف"
+	}
+
+	// الصلاحية المتبقية: من البوابة إن وُجدت، وإلا ما تبقى من وقت الخطة.
+	response.RemainingValidity = response.TimeLeft
+	if isUnlimited(profile.ExpAfter) {
+		response.RemainingValidity = "غير محدود"
+	} else if seconds, ok := parseValidity(profile.ExpAfter); ok {
+		response.RemainingValidity = formatSpan(seconds)
+	}
+
+	if expired {
+		response.ProfileState = "منتهي"
+		response.TimeLeft, response.RemainingValidity = "0", "0"
+	}
+	return response
+}
+
+// selectProfile يعيد البروفايل المستخدم، ويشير إلى أنه منتهٍ إن كانت كلها منتهية.
+func selectProfile(profiles []profileEntry) (profileEntry, bool) {
+	var expiredEntry profileEntry
+	for _, candidate := range profiles {
+		if !isExpired(candidate.State) {
+			return candidate, false
+		}
+		if expiredEntry.Name == "" {
+			expiredEntry = candidate
+		}
+	}
+	return expiredEntry, expiredEntry.Name != ""
+}
+
+func remaining(limit, used int64) int64 {
+	if used > limit {
+		return 0
+	}
+	return limit - used
+}
+
+// حالة البروفايل: 3 تعني مستهلك في اليوزر منجر.
+func isExpired(state json.RawMessage) bool {
+	if len(state) == 0 {
+		return false
+	}
+	var number int
+	if err := json.Unmarshal(state, &number); err == nil {
+		return number == 3
+	}
+	var text string
+	if err := json.Unmarshal(state, &text); err == nil {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "used", "expired", "stopped", "disabled":
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// تحليل صيغة البروفايل: السعر - البيانات - الوقت، مثل 1000-1G-8h
+// ---------------------------------------------------------------------------
+
+// parsePlan يستخرج حدود البيانات والوقت من اسم البروفايل:
+//   - الوحدة الكبيرة K/M/G/T تعني بيانات، والصغيرة w/d/h/m/s تعني وقتاً.
+//   - كلمة un/unlimited تعني غير محدود وتُسند للبيانات أولاً ثم للوقت.
+//   - الأرقام المجردة (السعر) تُتجاهل.
+func parsePlan(name string) (dataLimit int64, dataUnlimited bool, timeLimit int64, timeUnlimited bool) {
+	for _, token := range strings.FieldsFunc(name, isTokenSeparator) {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if isUnlimited(token) {
+			if dataLimit == 0 && !dataUnlimited {
+				dataUnlimited = true
+			} else {
+				timeUnlimited = true
+			}
+			continue
+		}
+		if size, ok := parseDataToken(token); ok {
+			if dataLimit == 0 && !dataUnlimited {
+				dataLimit = size
+			}
+			continue
+		}
+		if span, ok := parseTimeToken(token); ok {
+			if timeLimit == 0 && !timeUnlimited {
+				timeLimit = span
+			}
+		}
+	}
+	return dataLimit, dataUnlimited, timeLimit, timeUnlimited
+}
+
+func isTokenSeparator(r rune) bool { return r == '-' || r == '_' || r == '/' || r == ' ' || r == ',' }
+
+// parseDataToken يقبل "1G" و"1GB" و"500M"، ويرفض الأرقام المجردة.
+// الوحدة يجب أن تكون كبيرة (K/M/G/T) كما في صيغة اليوزر منجر "1000-1G-8h".
+func parseDataToken(token string) (int64, bool) {
+	text := strings.TrimSuffix(strings.TrimSpace(token), "B")
+	if len(text) < 2 {
+		return 0, false
+	}
+	multiplier, ok := sizeUnits[text[len(text)-1:]]
+	if !ok {
+		return 0, false
+	}
+	number, err := strconv.ParseFloat(text[:len(text)-1], 64)
+	if err != nil || number <= 0 {
+		return 0, false
+	}
+	return int64(number * float64(multiplier)), true
+}
+
+// parseTimeToken يقبل "8h" و"30m" و"1d" و"08:30:00".
+func parseTimeToken(token string) (int64, bool) {
+	text := strings.TrimSpace(token)
+	if strings.Contains(text, ":") {
+		return parseClock(text)
+	}
+	if !strings.ContainsAny(text, "wdhms") || strings.ContainsAny(text, "WDHMS") {
+		return 0, false
+	}
+	return parseSpanStrict(text)
+}
+
+func parseClock(text string) (int64, bool) {
+	parts := strings.Split(text, ":")
+	if len(parts) != 3 {
+		return 0, false
+	}
+	hours, err1 := strconv.ParseInt(parts[0], 10, 64)
+	minutes, err2 := strconv.ParseInt(parts[1], 10, 64)
+	seconds, err3 := strconv.ParseInt(parts[2], 10, 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return 0, false
+	}
+	return hours*3600 + minutes*60 + seconds, true
+}
+
+// ---------------------------------------------------------------------------
+// أدوات التحويل والتنسيق
+// ---------------------------------------------------------------------------
+
+var sizeUnits = map[string]int64{"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+
+// parseSize يحوّل "1.5G" أو "500M" أو "123456" إلى بايت.
+func parseSize(text string) int64 {
+	text = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(text), ",", ""))
+	if text == "" {
+		return 0
+	}
+	index := 0
+	for index < len(text) && (isDigit(text[index]) || text[index] == '.') {
+		index++
+	}
+	if index == 0 {
+		return 0
+	}
+	number, err := strconv.ParseFloat(text[:index], 64)
+	if err != nil {
+		return 0
+	}
+	suffix := strings.TrimRight(text[index:], "B")
+	if suffix == "" {
+		return int64(number)
+	}
+	multiplier, ok := sizeUnits[suffix]
+	if !ok {
+		return 0
+	}
+	return int64(number * float64(multiplier))
+}
+
+// parseSpan يحوّل "2h30m" أو "1d" أو "08:30:00" إلى ثوانٍ.
+func parseSpan(text string) int64 {
+	text = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(text), " ", ""))
+	if text == "" {
+		return 0
+	}
+	if span, ok := parseClock(text); ok {
+		return span
+	}
+	span, _ := parseSpanStrict(text)
+	return span
+}
+
+// parseSpanStrict يحوّل صيغة مثل "1d2h30m" إلى ثوانٍ.
+func parseSpanStrict(text string) (int64, bool) {
+	var total, number int64
+	hasNumber, matched := false, false
+	for index := 0; index < len(text); index++ {
+		char := text[index]
+		switch {
+		case isDigit(char):
+			number = number*10 + int64(char-'0')
+			hasNumber = true
+		case char == 'w' || char == 'd' || char == 'h' || char == 'm' || char == 's':
+			if !hasNumber {
+				return 0, false
+			}
+			switch char {
+			case 'w':
+				total += number * 604800
+			case 'd':
+				total += number * 86400
+			case 'h':
+				total += number * 3600
+			case 'm':
+				total += number * 60
+			case 's':
+				total += number
+			}
+			number, hasNumber, matched = 0, false, true
+		default:
+			return 0, false
+		}
+	}
+	if hasNumber || !matched {
+		return 0, false
+	}
+	return total, true
+}
+
+// parseValidity يقرأ expAfter: مدة متبقية أو تاريخ انتهاء.
+func parseValidity(text string) (int64, bool) {
+	text = strings.TrimSpace(text)
+	if text == "" || text == "..." {
+		return 0, false
+	}
+	if text == "-" || text == "0" {
+		return 0, true
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05"} {
+		if end, err := time.ParseInLocation(layout, text, time.Local); err == nil {
+			seconds := int64(time.Until(end).Seconds())
+			if seconds < 0 {
+				seconds = 0
+			}
+			return seconds, true
+		}
+	}
+	compact := strings.NewReplacer(" ", "", ",", "").Replace(strings.ToLower(text))
+	return parseSpanStrict(compact)
+}
+
+func formatBytes(bytes int64) string {
+	switch {
+	case bytes >= 1<<40:
+		return formatUnit(float64(bytes)/(1<<40), "TB")
+	case bytes >= 1<<30:
+		return formatUnit(float64(bytes)/(1<<30), "GB")
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.0f MB", float64(bytes)/(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.0f KB", float64(bytes)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+// formatUnit يحذف الكسر الصفري فيظهر "1 GB" بدل "1.0 GB".
+func formatUnit(value float64, unit string) string {
+	text := strings.TrimSuffix(strconv.FormatFloat(value, 'f', 1, 64), ".0")
+	return text + " " + unit
+}
+
+func formatSpan(seconds int64) string {
+	if seconds <= 0 {
+		return "0"
+	}
+	days := seconds / 86400
+	hours := (seconds % 86400) / 3600
+	minutes := (seconds % 3600) / 60
+	parts := make([]string, 0, 3)
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if minutes > 0 && days == 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	return strings.Join(parts, " ")
+}
+
+// إخفاء رقم الكرت: 0018067158 تصبح 00******58
+func maskUsername(user string) string {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		return ""
+	}
+	if len(user) <= 4 {
+		return strings.Repeat("*", len(user))
+	}
+	return user[:2] + strings.Repeat("*", len(user)-4) + user[len(user)-2:]
+}
+
+func isUnlimited(token string) bool {
+	switch strings.ToUpper(strings.TrimSpace(token)) {
+	case "UN", "UNL", "UNLTD", "UNLIMITED", "INF", "INFINITE":
+		return true
+	}
+	return false
+}
+
+func isDigit(char byte) bool { return char >= '0' && char <= '9' }
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// ---------------------------------------------------------------------------
+// التشغيل
+// ---------------------------------------------------------------------------
+
+func main() {
+	http.HandleFunc("/api/user-status", handleStatus)
+	http.HandleFunc("/api/status", handleStatus)
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	log.Printf("الخدمة على %s | بوابة اليوزر منجر: %s | تأخير الخروج: %s",
+		cfg.listenAddr, cfg.portalURL, cfg.logoutDelay)
+	if err := http.ListenAndServe(cfg.listenAddr, nil); err != nil {
+		log.Fatalf("توقفت الخدمة: %v", err)
+	}
 }

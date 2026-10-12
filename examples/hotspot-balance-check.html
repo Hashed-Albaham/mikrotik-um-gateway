@@ -109,8 +109,6 @@
     // Address of the gateway as reachable from the client device.
     var API_BASE = "http://172.17.0.2:8080";
 
-    var STATE_LABELS = { active: "نشط", expired: "منتهي", unknown: "غير معروف" };
-
     // On a RouterOS hotspot $(username) is substituted with the logged in
     // account; when this page is opened elsewhere the token stays literal.
     var userField = document.getElementById("card_user");
@@ -164,9 +162,8 @@
           setText("r_time", data.time_left);
           setText("r_time_total", data.total_time);
           setText("r_validity", data.remaining_validity);
-          setText("r_state", STATE_LABELS[data.profile_state] || data.profile_state);
-          var sessions = data.sessions || {};
-          setText("r_sessions", sessions.active_sessions);
+          setText("r_state", data.profile_state);
+          setText("r_sessions", data.active_sessions);
           document.getElementById("result").style.display = "block";
         })
         .catch(function (error) {
