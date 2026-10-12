@@ -1,0 +1,13 @@
+.git
+.github
+bin
+scripts
+docs
+*.md
+Dockerfile
+docker-compose.yml
+Makefile
+.gitignore
+.dockerignore
+.env
+.env.*

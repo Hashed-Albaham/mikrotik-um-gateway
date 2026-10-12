@@ -1,0 +1,18 @@
+# Build output
+/bin/
+um-status-gateway
+
+# Local environment overrides (never commit real credentials)
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# Test and coverage artifacts
+*.out
+coverage.*
+/mikrotik-um-gateway
