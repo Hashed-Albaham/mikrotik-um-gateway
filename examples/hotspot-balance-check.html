@@ -10,8 +10,7 @@
     2. API_BASE below must point at the gateway, as seen from the client device.
        That is normally the container address on the container network.
 
-  The page talks to GET /api/user-status and renders the human readable fields
-  of the response; the numeric values stay available under "raw" for scripts.
+  The page talks to POST /api/user-status and renders the human-readable fields.
 -->
 <html lang="ar" dir="rtl">
 <head>
@@ -141,10 +140,16 @@
       button.disabled = true;
       button.innerText = "جارٍ الفحص...";
 
-      var url = API_BASE + "/api/user-status?user=" + encodeURIComponent(user) +
-                "&pass=" + encodeURIComponent(pass);
+      var form = new URLSearchParams();
+      form.set("user", user);
+      form.set("pass", pass);
 
-      fetch(url, { cache: "no-store" })
+      fetch(API_BASE + "/api/user-status", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: form.toString(),
+        cache: "no-store"
+      })
         .then(function (response) {
           return response.json().then(function (data) {
             return { status: response.status, data: data };
