@@ -169,7 +169,7 @@ docker build -t um-status-gateway .
 docker run --rm -p 8080:8080 -e UM_HOST=192.168.216.1 -e UM_PORT=12008 um-status-gateway
 ```
 
-سير عمل GitHub Actions يبني الصورة تلقائياً لكل من `linux/amd64` و`linux/arm64` و`linux/arm/v7` ويرفعها إلى GHCR، ويفشل البناء إذا تجاوز حجم صورة `amd64` عشرة ميجابايت.
+سير عمل GitHub Actions يبني الصورة تلقائياً للمعماريات `linux/386` و`linux/amd64` و`linux/arm64` و`linux/arm/v5` و`linux/arm/v6` و`linux/arm/v7` ويرفعها إلى GHCR. تشمل ARMv5 أجهزة بمعالج EN7562CT مثل hEX Refresh. هذه معماريات الصور التي تلائم عائلات RouterOS للحاويات (x86 وARM32 وARM64)؛ أجهزة MIPS وTILE لا يدعم RouterOS تشغيل الحاويات عليها. يفشل البناء إذا تجاوز حجم صورة `amd64` عشرة ميجابايت.
 
 ## ملاحظات فنية
 
@@ -185,3 +185,15 @@ docker run --rm -p 8080:8080 -e UM_HOST=192.168.216.1 -e UM_PORT=12008 um-status
 
 MIT، انظر [LICENSE](LICENSE).
 - **قياس فعلي**: 8.2 ميجابايت بعد الإقلاع، و9.4 ميجابايت بعد 50 طلباً، وحجم الملف التنفيذي 6.9 ميجابايت (قِيست على `linux/amd64` بـ `GOGC=20` و`GOMEMLIMIT=4MiB`).
+
+### تحديث الصورة بعد تغيير الإصدار
+
+بعد نجاح بناء GitHub Actions، أوقف الحاوية وحدّث الصورة ثم شغّلها مجدداً:
+
+```routeros
+/container/stop umgw
+/container/update umgw
+/container/start umgw
+```
+
+أمر `update` يسحب الصورة المنشورة حديثاً ويستبدل الصورة القديمة. إذا استمر `Exec format error` بعد التحديث، أرسل ناتج `/system/resource/print` و`/container/print` لتحديد المعمارية الدقيقة للراوتر.
