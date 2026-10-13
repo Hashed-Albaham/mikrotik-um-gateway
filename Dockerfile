@@ -4,20 +4,29 @@
 # البناء يتم على معمارية المُنشئ ثم يُترجم للمعمارية المطلوبة.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
-ARG TARGETVARIANT=""
+# These BuildKit-provided arguments must not have defaults. A hard-coded
+# TARGETARCH default can accidentally build an amd64 executable for ARM images.
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
 
 RUN apk add --no-cache ca-certificates
 
 WORKDIR /src
 COPY go.mod main.go ./
 
-RUN CGO_ENABLED=0 \
-    GOOS=${TARGETOS} \
-    GOARCH=${TARGETARCH} \
-    GOARM=${TARGETVARIANT#v} \
-    go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/um-status-gateway .
+RUN set -eu; \
+    export GOOS="$TARGETOS" GOARCH="$TARGETARCH"; \
+    if [ "$TARGETARCH" = "arm" ]; then \
+        case "$TARGETVARIANT" in \
+            v5|v6|v7) export GOARM="${TARGETVARIANT#v}" ;; \
+            *) echo "Unsupported ARM variant: $TARGETVARIANT" >&2; exit 1 ;; \
+        esac; \
+    fi; \
+    echo "Building $GOOS/$GOARCH${TARGETVARIANT:+/$TARGETVARIANT} (GOARM=${GOARM:-default})"; \
+    test "$(go env GOARCH)" = "$TARGETARCH"; \
+    if [ "$TARGETARCH" = "arm" ]; then test "$(go env GOARM)" = "${TARGETVARIANT#v}"; fi; \
+    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/um-status-gateway .
 
 # المرحلة الثانية: صورة فارغة لا تحتوي إلا الملف التنفيذي وشهادات الثقة.
 FROM scratch
